@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./verifyai.db"
     jwt_secret: str = "super-secret-key-change-me"
     jwt_algorithm: str = "HS256"
+    access_token_expire_minutes: int = 60 * 24
     ai_service_url: str = "http://localhost:8001"
 
     class Config:

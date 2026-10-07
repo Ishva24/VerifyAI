@@ -1,52 +1,74 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, Text, ForeignKey, func
-from sqlalchemy.orm import relationship
+from datetime import datetime, timedelta
 
-from app.database import Base
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from sqlalchemy.orm import Session
 
+from app.config import settings
+from app.database import get_db
+from app.models import User
 
-class User(Base):
-    __tablename__ = "users"
-
-    id = Column(Integer, primary_key=True, index=True)
-    email = Column(String(255), unique=True, index=True, nullable=False)
-    name = Column(String(255), nullable=False)
-    password_hash = Column(String(255), nullable=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-
-    verifications = relationship("ContentVerification", back_populates="owner")
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+security = HTTPBearer(auto_error=False)
 
 
-class ContentVerification(Base):
-    __tablename__ = "content_verifications"
-
-    id = Column(Integer, primary_key=True, index=True)
-    title = Column(String(255), nullable=False)
-    content_type = Column(String(50), nullable=False)
-    content_text = Column(Text, default="")
-    source_url = Column(String(500), nullable=True)
-    source_name = Column(String(255), nullable=True)
-    status = Column(String(50), default="pending")
-    risk_score = Column(Float, default=0.0)
-    confidence = Column(Float, default=0.0)
-    verdict = Column(String(50), default="unknown")
-    analysis_summary = Column(Text, default="")
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-
-    owner_id = Column(Integer, ForeignKey("users.id"), nullable=True)
-    owner = relationship("User", back_populates="verifications")
-    report = relationship("VerificationReport", uselist=False, back_populates="verification")
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
 
 
-class VerificationReport(Base):
-    __tablename__ = "verification_reports"
+def verify_password(password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(password, hashed_password)
 
-    id = Column(Integer, primary_key=True, index=True)
-    verification_id = Column(Integer, ForeignKey("content_verifications.id"), unique=True, nullable=False)
-    source_credibility = Column(Float, default=0.0)
-    ai_likelihood = Column(Float, default=0.0)
-    manipulation_signals = Column(Text, default="")
-    recommendations = Column(Text, default="")
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
 
-    verification = relationship("ContentVerification", back_populates="report")
+def create_access_token(email: str, role: str) -> str:
+    expires_delta = timedelta(minutes=settings.access_token_expire_minutes)
+    expire = datetime.utcnow() + expires_delta
+    payload = {"sub": email, "role": role, "exp": expire}
+    return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+
+
+def decode_access_token(token: str):
+    try:
+        payload = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
+        return payload
+    except JWTError:
+        return None
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
+    db: Session = Depends(get_db),
+) -> User:
+    if not credentials:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+
+    payload = decode_access_token(credentials.credentials)
+    if not payload:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+
+    email = payload.get("sub")
+    if not email:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing user info in token")
+
+    user = db.query(User).filter(User.email == email).first()
+    if not user or not user.is_active:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not active")
+
+    return user
+
+
+def require_roles(*allowed_roles: str):
+    def dependency(current_user: User = Depends(get_current_user)) -> User:
+        if current_user.role not in allowed_roles:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+        return current_user
+
+    return dependency
+
+
+def require_admin(current_user: User = Depends(get_current_user)) -> User:
+    if current_user.role != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+    return current_user

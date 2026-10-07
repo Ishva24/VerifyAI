@@ -1,35 +1,37 @@
-from fastapi import APIRouter, Depends
-from sqlalchemy.orm import Session
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
-from app.database import get_db
-from app.models import ContentVerification, User
+from app.config import settings
+from app.database import create_tables
+from app.routes.auth import router as auth_router
+from app.routes.content import router as content_router
+from app.routes.dashboard import router as dashboard_router
 
-router = APIRouter(tags=["dashboard"])
+app = FastAPI(
+    title="VerifyAI API",
+    description="AI content verification and trust analysis platform",
+    version="1.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(auth_router, prefix="/api")
+app.include_router(content_router, prefix="/api")
+app.include_router(dashboard_router, prefix="/api")
+
+create_tables()
 
 
-@router.get("/dashboard")
-def dashboard(db: Session = Depends(get_db)):
-    total = db.query(ContentVerification).count()
-    low_risk = db.query(ContentVerification).filter(ContentVerification.verdict == "low_risk").count()
-    flagged = db.query(ContentVerification).filter(ContentVerification.verdict == "likely_malicious").count()
-    review = db.query(ContentVerification).filter(ContentVerification.verdict == "requires_review").count()
-    users = db.query(User).count()
-
+@app.get("/api/health")
+def health_check():
     return {
-        "summary": {
-            "total_verifications": total,
-            "low_risk": low_risk,
-            "flagged": flagged,
-            "requires_review": review,
-            "active_users": users,
-        },
-        "recent_activity": [
-            {
-                "title": v.title,
-                "verdict": v.verdict,
-                "risk_score": v.risk_score,
-                "created_at": v.created_at.isoformat(),
-            }
-            for v in db.query(ContentVerification).order_by(ContentVerification.created_at.desc()).limit(5).all()
-        ],
+        "status": "ok",
+        "service": "verifyai-backend",
+        "environment": settings.environment,
     }

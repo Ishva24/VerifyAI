@@ -1,19 +1,30 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from pathlib import Path
+from typing import Optional
+from uuid import uuid4
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy.orm import Session
-from typing import Any
 
 from app.database import get_db
-from app.models import ContentVerification, VerificationReport
-from app.schemas import VerificationInput, VerificationResponse
-from app.services.verifier import build_verification_result
-from app.services.analytics import call_ai_service
+from app.dependencies import get_current_user, require_roles
+from app.models import ContentVerification, User, VerificationEvidence, VerificationReport
+from app.schemas import VerificationInput, VerificationResponse, VerificationUpdate
+from app.services.verifier import build_verification_result, call_ai_service
 
 router = APIRouter(tags=["content"])
+UPLOAD_ROOT = Path(__file__).resolve().parents[2] / "uploads"
+UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
 
 
 @router.post("/verifications", response_model=VerificationResponse)
-async def create_verification(payload: VerificationInput, db: Session = Depends(get_db)):
-    risk_score, confidence, verdict, summary, manipulation_signals, recommendations = build_verification_result(payload.model_dump())
+async def create_verification(
+    payload: VerificationInput,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    risk_score, confidence, verdict, summary, manipulation_signals, recommendations = build_verification_result(
+        payload.model_dump()
+    )
 
     verification = ContentVerification(
         title=payload.title,
@@ -21,7 +32,10 @@ async def create_verification(payload: VerificationInput, db: Session = Depends(
         content_text=payload.content_text,
         source_url=payload.source_url,
         source_name=payload.source_name,
-        status="completed",
+        source_domain=payload.source_domain,
+        priority=payload.priority,
+        owner_id=current_user.id,
+        status="queued",
         risk_score=risk_score,
         confidence=confidence,
         verdict=verdict,
@@ -31,12 +45,15 @@ async def create_verification(payload: VerificationInput, db: Session = Depends(
     db.commit()
     db.refresh(verification)
 
-    ai_data = await call_ai_service({
-        "content_type": payload.content_type,
-        "content_text": payload.content_text,
-        "source_url": payload.source_url,
-        "source_name": payload.source_name,
-    })
+    ai_data = await call_ai_service(
+        {
+            "content_type": payload.content_type,
+            "content_text": payload.content_text,
+            "source_url": payload.source_url,
+            "source_name": payload.source_name,
+            "source_domain": payload.source_domain,
+        }
+    )
 
     report = VerificationReport(
         verification_id=verification.id,
@@ -46,7 +63,9 @@ async def create_verification(payload: VerificationInput, db: Session = Depends(
         recommendations="; ".join(recommendations),
     )
     db.add(report)
+    verification.status = "needs_review" if verdict != "low_risk" else "verified"
     db.commit()
+    db.refresh(verification)
 
     return VerificationResponse(
         id=verification.id,
@@ -61,12 +80,131 @@ async def create_verification(payload: VerificationInput, db: Session = Depends(
         ai_likelihood=report.ai_likelihood,
         manipulation_signals=manipulation_signals,
         recommendations=recommendations,
+        owner_id=current_user.id,
+    )
+
+
+@router.post("/verifications/upload", response_model=VerificationResponse)
+async def upload_verification(
+    title: str = Form(...),
+    content_type: str = Form("image"),
+    source_url: Optional[str] = Form(None),
+    source_name: Optional[str] = Form(None),
+    source_domain: Optional[str] = Form(None),
+    priority: str = Form("medium"),
+    file: Optional[UploadFile] = File(None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    uploaded_filename = file.filename if file and file.filename else ""
+    storage_path = None
+    evidence_type = "media"
+
+    if file and file.filename:
+        file_ext = Path(file.filename).suffix
+        safe_name = f"{uuid4().hex}{file_ext}"
+        verification_dir = UPLOAD_ROOT / f"verification_{uuid4().hex}"
+        verification_dir.mkdir(parents=True, exist_ok=True)
+        storage_path = verification_dir / safe_name
+        contents = await file.read()
+        storage_path.write_bytes(contents)
+
+    content_text = f"Uploaded file: {uploaded_filename}" if uploaded_filename else ""
+    payload = {
+        "title": title,
+        "content_type": content_type,
+        "content_text": content_text,
+        "source_url": source_url,
+        "source_name": source_name,
+        "source_domain": source_domain,
+        "priority": priority,
+        "file_metadata": {
+            "name": uploaded_filename,
+            "path": str(storage_path) if storage_path else None,
+            "content_type": file.content_type if file else None,
+        },
+    }
+
+    risk_score, confidence, verdict, summary, manipulation_signals, recommendations = build_verification_result(payload)
+
+    verification = ContentVerification(
+        title=title,
+        content_type=content_type,
+        content_text=content_text,
+        source_url=source_url,
+        source_name=source_name,
+        source_domain=source_domain,
+        priority=priority,
+        owner_id=current_user.id,
+        status="queued",
+        risk_score=risk_score,
+        confidence=confidence,
+        verdict=verdict,
+        analysis_summary=summary,
+    )
+    db.add(verification)
+    db.commit()
+    db.refresh(verification)
+
+    if storage_path:
+        evidence = VerificationEvidence(
+            verification_id=verification.id,
+            file_name=uploaded_filename,
+            storage_path=str(storage_path),
+            evidence_type=evidence_type,
+        )
+        db.add(evidence)
+
+    ai_data = await call_ai_service({
+        "content_type": content_type,
+        "content_text": content_text,
+        "source_url": source_url,
+        "source_name": source_name,
+        "source_domain": source_domain,
+        "file_metadata": payload["file_metadata"],
+    })
+
+    report = VerificationReport(
+        verification_id=verification.id,
+        source_credibility=ai_data.get("source_credibility", 0.5),
+        ai_likelihood=ai_data.get("ai_likelihood", 0.5),
+        manipulation_signals=", ".join(manipulation_signals),
+        recommendations="; ".join(recommendations),
+    )
+    db.add(report)
+    verification.status = "needs_review" if verdict != "low_risk" else "verified"
+    db.commit()
+    db.refresh(verification)
+
+    return VerificationResponse(
+        id=verification.id,
+        title=verification.title,
+        content_type=verification.content_type,
+        status=verification.status,
+        risk_score=verification.risk_score,
+        confidence=verification.confidence,
+        verdict=verification.verdict,
+        analysis_summary=verification.analysis_summary,
+        source_credibility=report.source_credibility,
+        ai_likelihood=report.ai_likelihood,
+        manipulation_signals=manipulation_signals,
+        recommendations=recommendations,
+        owner_id=current_user.id,
     )
 
 
 @router.get("/verifications")
-def list_verifications(db: Session = Depends(get_db)):
-    items = db.query(ContentVerification).order_by(ContentVerification.created_at.desc()).all()
+def list_verifications(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    if current_user.role == "admin":
+        items = db.query(ContentVerification).order_by(ContentVerification.created_at.desc()).all()
+    else:
+        items = (
+            db.query(ContentVerification)
+            .filter(ContentVerification.owner_id == current_user.id)
+            .order_by(ContentVerification.created_at.desc())
+            .all()
+        )
+
     return [
         {
             "id": item.id,
@@ -75,7 +213,45 @@ def list_verifications(db: Session = Depends(get_db)):
             "risk_score": item.risk_score,
             "verdict": item.verdict,
             "status": item.status,
+            "priority": item.priority,
             "created_at": item.created_at.isoformat(),
         }
         for item in items
     ]
+
+
+@router.get("/verifications/{verification_id}")
+def get_verification(verification_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    item = db.query(ContentVerification).filter(ContentVerification.id == verification_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Verification not found")
+    if current_user.role != "admin" and item.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="Not allowed to access this verification")
+    return item
+
+
+@router.patch("/verifications/{verification_id}")
+def update_verification(
+    verification_id: int,
+    payload: VerificationUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_roles("admin", "analyst")),
+):
+    item = db.query(ContentVerification).filter(ContentVerification.id == verification_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Verification not found")
+    if payload.status:
+        item.status = payload.status
+    if payload.priority:
+        item.priority = payload.priority
+    if payload.verdict:
+        item.verdict = payload.verdict
+    if payload.analysis_summary:
+        item.analysis_summary = payload.analysis_summary
+    if payload.risk_score is not None:
+        item.risk_score = payload.risk_score
+    if payload.confidence is not None:
+        item.confidence = payload.confidence
+    db.commit()
+    db.refresh(item)
+    return item

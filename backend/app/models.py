@@ -1,74 +1,133 @@
-from datetime import datetime, timedelta
+import enum
 
-from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from jose import JWTError, jwt
-from passlib.context import CryptContext
-from sqlalchemy.orm import Session
+from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, String, Text, func
+from sqlalchemy.orm import relationship
 
-from app.config import settings
-from app.database import get_db
-from app.models import User
-
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-security = HTTPBearer(auto_error=False)
+from app.database import Base
 
 
-def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+class UserRole(str, enum.Enum):
+    admin = "admin"
+    analyst = "analyst"
+    viewer = "viewer"
 
 
-def verify_password(password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(password, hashed_password)
+class VerificationPriority(str, enum.Enum):
+    low = "low"
+    medium = "medium"
+    high = "high"
+    critical = "critical"
 
 
-def create_access_token(email: str, role: str) -> str:
-    expires_delta = timedelta(minutes=settings.access_token_expire_minutes)
-    expire = datetime.utcnow() + expires_delta
-    payload = {"sub": email, "role": role, "exp": expire}
-    return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+class VerificationStatus(str, enum.Enum):
+    queued = "queued"
+    processing = "processing"
+    needs_review = "needs_review"
+    under_review = "under_review"
+    verified = "verified"
+    rejected = "rejected"
+    archived = "archived"
 
 
-def decode_access_token(token: str):
-    try:
-        payload = jwt.decode(token, settings.jwt_secret, algorithms=[settings.jwt_algorithm])
-        return payload
-    except JWTError:
-        return None
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String(255), unique=True, index=True, nullable=False)
+    name = Column(String(255), nullable=False)
+    password_hash = Column(String(255), nullable=False)
+    role = Column(String(30), default=UserRole.viewer.value, nullable=False)
+    is_active = Column(Integer, default=1, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    verifications = relationship("ContentVerification", back_populates="owner")
+    audit_logs = relationship("AuditLog", back_populates="user")
+    reviews = relationship("VerificationReview", back_populates="reviewer")
 
 
-def get_current_user(
-    credentials: HTTPAuthorizationCredentials | None = Depends(security),
-    db: Session = Depends(get_db),
-) -> User:
-    if not credentials:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+class ContentVerification(Base):
+    __tablename__ = "content_verifications"
 
-    payload = decode_access_token(credentials.credentials)
-    if not payload:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+    id = Column(Integer, primary_key=True, index=True)
+    title = Column(String(255), nullable=False)
+    content_type = Column(String(50), nullable=False)
+    content_text = Column(Text, default="")
+    source_url = Column(String(500), nullable=True)
+    source_name = Column(String(255), nullable=True)
+    source_domain = Column(String(255), nullable=True)
+    status = Column(String(50), default=VerificationStatus.queued.value)
+    priority = Column(String(20), default=VerificationPriority.medium.value)
+    risk_score = Column(Float, default=0.0)
+    confidence = Column(Float, default=0.0)
+    verdict = Column(String(50), default="unknown")
+    analysis_summary = Column(Text, default="")
+    job_id = Column(String(255), nullable=True, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    completed_at = Column(DateTime(timezone=True), nullable=True)
 
-    email = payload.get("sub")
-    if not email:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing user info in token")
-
-    user = db.query(User).filter(User.email == email).first()
-    if not user or not user.is_active:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not active")
-
-    return user
-
-
-def require_roles(*allowed_roles: str):
-    def dependency(current_user: User = Depends(get_current_user)) -> User:
-        if current_user.role not in allowed_roles:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
-        return current_user
-
-    return dependency
+    owner_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    owner = relationship("User", back_populates="verifications")
+    report = relationship("VerificationReport", uselist=False, back_populates="verification")
+    evidence = relationship("VerificationEvidence", back_populates="verification")
+    reviews = relationship("VerificationReview", back_populates="verification")
 
 
-def require_admin(current_user: User = Depends(get_current_user)) -> User:
-    if current_user.role != "admin":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
-    return current_user
+class VerificationReport(Base):
+    __tablename__ = "verification_reports"
+
+    id = Column(Integer, primary_key=True, index=True)
+    verification_id = Column(Integer, ForeignKey("content_verifications.id"), unique=True, nullable=False)
+    source_credibility = Column(Float, default=0.0)
+    ai_likelihood = Column(Float, default=0.0)
+    manipulation_signals = Column(Text, default="")
+    recommendations = Column(Text, default="")
+    evidence_notes = Column(Text, default="")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    verification = relationship("ContentVerification", back_populates="report")
+
+
+class VerificationEvidence(Base):
+    __tablename__ = "verification_evidence"
+
+    id = Column(Integer, primary_key=True, index=True)
+    verification_id = Column(Integer, ForeignKey("content_verifications.id"), nullable=False)
+    file_name = Column(String(255), nullable=False)
+    storage_path = Column(String(500), nullable=False)
+    evidence_type = Column(String(50), default="media")
+    file_size = Column(Integer, default=0)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    verification = relationship("ContentVerification", back_populates="evidence")
+
+
+class VerificationReview(Base):
+    __tablename__ = "verification_reviews"
+
+    id = Column(Integer, primary_key=True, index=True)
+    verification_id = Column(Integer, ForeignKey("content_verifications.id"), nullable=False)
+    reviewer_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    status = Column(String(50), default="pending")
+    verdict = Column(String(50), nullable=True)
+    notes = Column(Text, default="")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    verification = relationship("ContentVerification", back_populates="reviews")
+    reviewer = relationship("User", back_populates="reviews")
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    action = Column(String(255), nullable=False)
+    resource_type = Column(String(100), nullable=True)
+    resource_id = Column(Integer, nullable=True)
+    message = Column(Text, default="")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", back_populates="audit_logs")

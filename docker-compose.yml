@@ -1,0 +1,55 @@
+version: '3.9'
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: verifyai-postgres
+    environment:
+      POSTGRES_DB: verifyai
+      POSTGRES_USER: verifyai
+      POSTGRES_PASSWORD: verifyai123
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: verifyai-backend
+    depends_on:
+      - postgres
+    environment:
+      DATABASE_URL: postgresql://verifyai:verifyai123@postgres:5432/verifyai
+      AI_SERVICE_URL: http://ai-service:8001
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+
+  ai-service:
+    build:
+      context: ./ai-service
+      dockerfile: Dockerfile
+    container_name: verifyai-ai
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./ai-service:/app
+
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    container_name: verifyai-web
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+    volumes:
+      - ./web:/app
+      - /app/node_modules
+
+volumes:
+  postgres_data:
